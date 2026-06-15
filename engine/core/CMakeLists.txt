@@ -1,6 +1,7 @@
 bdex_add_library(core
     SOURCES
         src/Assert.cpp
+        src/FileSystem.cpp
         src/Log.cpp
     PUBLIC_DEPS
         glm::glm
