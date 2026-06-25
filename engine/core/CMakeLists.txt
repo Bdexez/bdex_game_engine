@@ -2,6 +2,7 @@ bdex_add_library(core
     SOURCES
         src/Assert.cpp
         src/Config.cpp
+        src/EventBus.cpp
         src/FileSystem.cpp
         src/Log.cpp
     PUBLIC_DEPS
