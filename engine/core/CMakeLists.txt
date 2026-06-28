@@ -5,6 +5,7 @@ bdex_add_library(core
         src/EventBus.cpp
         src/FileSystem.cpp
         src/Log.cpp
+        src/Scheduler.cpp
     PUBLIC_DEPS
         glm::glm
     PRIVATE_DEPS
