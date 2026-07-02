@@ -4,6 +4,7 @@ bdex_add_library(core
         src/Config.cpp
         src/EventBus.cpp
         src/FileSystem.cpp
+        src/JobSystem.cpp
         src/Log.cpp
         src/Scheduler.cpp
     PUBLIC_DEPS

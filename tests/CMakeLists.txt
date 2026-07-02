@@ -9,6 +9,7 @@ add_executable(bdex_tests
     core/ConfigTests.cpp
     core/EventBusTests.cpp
     core/HandleTests.cpp
+    core/JobSystemTests.cpp
     core/SchedulerTests.cpp
     core/ServiceRegistryTests.cpp
     core/TypeIdTests.cpp)
