@@ -7,6 +7,7 @@ bdex_add_library(core
         src/FileSystem.cpp
         src/JobSystem.cpp
         src/Log.cpp
+        src/ModuleManager.cpp
         src/Scheduler.cpp
     PUBLIC_DEPS
         glm::glm
