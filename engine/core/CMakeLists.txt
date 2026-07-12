@@ -3,6 +3,7 @@ bdex_add_library(core
         src/Assert.cpp
         src/Config.cpp
         src/DynamicLibrary.cpp
+        src/Engine.cpp
         src/EventBus.cpp
         src/FileSystem.cpp
         src/JobSystem.cpp

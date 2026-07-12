@@ -7,6 +7,7 @@ include(GoogleTest)
 
 add_executable(bdex_tests
     core/ConfigTests.cpp
+    core/EngineTests.cpp
     core/EventBusTests.cpp
     core/HandleTests.cpp
     core/JobSystemTests.cpp
