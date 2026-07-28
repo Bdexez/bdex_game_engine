@@ -21,10 +21,12 @@ add_executable(bdex_tests
     core/ModuleManagerTests.cpp
     core/SchedulerTests.cpp
     core/ServiceRegistryTests.cpp
-    core/TypeIdTests.cpp)
+    core/TypeIdTests.cpp
+    ecs/WorldTests.cpp)
 target_include_directories(bdex_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(bdex_tests PRIVATE
     bdex::core
+    bdex::ecs
     GTest::gtest
     GTest::gtest_main)
 bdex_configure_target(bdex_tests)
