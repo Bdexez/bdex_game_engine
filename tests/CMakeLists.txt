@@ -28,6 +28,7 @@ target_link_libraries(bdex_tests PRIVATE
     bdex::core
     bdex::ecs
     bdex::platform
+    bdex::rhi
     GTest::gtest
     GTest::gtest_main)
 bdex_configure_target(bdex_tests)

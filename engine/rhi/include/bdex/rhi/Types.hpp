@@ -1,0 +1,274 @@
+#pragma once
+
+#include <bdex/core/Flags.hpp>
+#include <bdex/core/Handle.hpp>
+#include <bdex/core/Types.hpp>
+
+#include <array>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace bdex::platform {
+class IWindow;
+}
+
+/// Render Hardware Interface: a small, explicit, backend-agnostic description
+/// of GPU resources and commands. Renderers are written against these types
+/// only; `rhi_vulkan` (or any other backend module) turns them into API calls.
+namespace bdex::rhi {
+
+// --- Handles -----------------------------------------------------------------
+// GPU objects are referred to by typed generational handles. The device owns
+// the objects; a stale handle is detected instead of dereferenced.
+
+using BufferHandle = Handle<struct BufferTag>;
+using TextureHandle = Handle<struct TextureTag>;
+using SamplerHandle = Handle<struct SamplerTag>;
+using ShaderHandle = Handle<struct ShaderTag>;
+using BindGroupLayoutHandle = Handle<struct BindGroupLayoutTag>;
+using BindGroupHandle = Handle<struct BindGroupTag>;
+using PipelineHandle = Handle<struct PipelineTag>;
+using SwapchainHandle = Handle<struct SwapchainTag>;
+
+// --- Formats -----------------------------------------------------------------
+
+enum class Format : u8 {
+    Undefined,
+    RGBA8Unorm,
+    RGBA8Srgb,
+    BGRA8Unorm,
+    BGRA8Srgb,
+    RGBA16Float,
+    D32Float,
+    D24UnormS8Uint,
+};
+
+[[nodiscard]] bool isDepthFormat(Format format);
+[[nodiscard]] bool hasStencil(Format format);
+[[nodiscard]] u32 bytesPerPixel(Format format);
+[[nodiscard]] std::string_view formatName(Format format);
+
+// --- Buffers -----------------------------------------------------------------
+
+enum class BufferUsage : u32 {
+    None = 0,
+    Vertex = 1 << 0,
+    Index = 1 << 1,
+    Uniform = 1 << 2,
+    Storage = 1 << 3,
+    TransferSrc = 1 << 4,
+    TransferDst = 1 << 5,
+};
+BDEX_ENUM_FLAGS(BufferUsage)
+
+enum class MemoryUsage : u8 {
+    GpuOnly,   ///< Device-local. Written through IDevice::writeBuffer (staged copy).
+    CpuToGpu,  ///< Host-visible, persistently mapped. For data rewritten every frame.
+    GpuToCpu,  ///< Host-visible, for readbacks.
+};
+
+struct BufferDesc {
+    u64 size = 0;
+    BufferUsage usage = BufferUsage::None;
+    MemoryUsage memory = MemoryUsage::GpuOnly;
+    std::string debugName;
+};
+
+// --- Textures & samplers -----------------------------------------------------
+
+enum class TextureUsage : u32 {
+    None = 0,
+    Sampled = 1 << 0,
+    ColorAttachment = 1 << 1,
+    DepthStencilAttachment = 1 << 2,
+    TransferSrc = 1 << 3,
+    TransferDst = 1 << 4,
+};
+BDEX_ENUM_FLAGS(TextureUsage)
+
+struct TextureDesc {
+    u32 width = 1;
+    u32 height = 1;
+    Format format = Format::RGBA8Unorm;
+    TextureUsage usage = TextureUsage::Sampled;
+    std::string debugName;
+};
+
+enum class Filter : u8 { Nearest, Linear };
+enum class AddressMode : u8 { Repeat, MirroredRepeat, ClampToEdge };
+
+struct SamplerDesc {
+    Filter minFilter = Filter::Linear;
+    Filter magFilter = Filter::Linear;
+    AddressMode addressMode = AddressMode::Repeat;
+    std::string debugName;
+};
+
+// --- Shaders -----------------------------------------------------------------
+
+enum class ShaderStage : u32 {
+    None = 0,
+    Vertex = 1 << 0,
+    Fragment = 1 << 1,
+    Compute = 1 << 2,
+};
+BDEX_ENUM_FLAGS(ShaderStage)
+
+struct ShaderDesc {
+    ShaderStage stage = ShaderStage::None;
+    std::span<const u32> spirv;  ///< SPIR-V words; only read during creation.
+    std::string entryPoint = "main";
+    std::string debugName;
+};
+
+// --- Resource binding ----------------------------------------------------------
+// A bind group is a set of resources bound together (a descriptor set in
+// Vulkan terms); its layout declares the shape shaders expect.
+
+enum class BindingType : u8 { UniformBuffer, StorageBuffer, CombinedTextureSampler };
+
+struct BindGroupLayoutEntry {
+    u32 binding = 0;
+    BindingType type = BindingType::UniformBuffer;
+    ShaderStage stages = ShaderStage::None;
+};
+
+struct BindGroupLayoutDesc {
+    std::vector<BindGroupLayoutEntry> entries;
+    std::string debugName;
+};
+
+inline constexpr u64 kWholeSize = ~0ull;
+
+struct BindGroupEntry {
+    u32 binding = 0;
+    // For UniformBuffer / StorageBuffer bindings:
+    BufferHandle buffer;
+    u64 offset = 0;
+    u64 size = kWholeSize;
+    // For CombinedTextureSampler bindings:
+    TextureHandle texture;
+    SamplerHandle sampler;
+};
+
+struct BindGroupDesc {
+    BindGroupLayoutHandle layout;
+    std::vector<BindGroupEntry> entries;
+    std::string debugName;
+};
+
+// --- Pipelines -----------------------------------------------------------------
+
+enum class VertexFormat : u8 { Float, Float2, Float3, Float4, UByte4Norm };
+
+struct VertexAttribute {
+    u32 location = 0;
+    VertexFormat format = VertexFormat::Float3;
+    u32 offset = 0;
+};
+
+/// Layout of one interleaved vertex buffer. A stride of 0 means the pipeline
+/// consumes no vertex buffer (e.g. a full-screen triangle built from
+/// gl_VertexIndex).
+struct VertexLayout {
+    u32 stride = 0;
+    std::vector<VertexAttribute> attributes;
+};
+
+enum class PrimitiveTopology : u8 { TriangleList, TriangleStrip, LineList, PointList };
+enum class CullMode : u8 { None, Front, Back };
+enum class FrontFace : u8 { CounterClockwise, Clockwise };
+enum class CompareOp : u8 { Never, Less, Equal, LessOrEqual, Greater, NotEqual, GreaterOrEqual, Always };
+enum class BlendMode : u8 { Opaque, AlphaBlend, Additive };
+
+struct GraphicsPipelineDesc {
+    ShaderHandle vertexShader;
+    ShaderHandle fragmentShader;
+    VertexLayout vertexLayout;
+
+    /// Layout of set 0, 1, 2... in order.
+    std::vector<BindGroupLayoutHandle> bindGroupLayouts;
+    u32 pushConstantSize = 0;
+    ShaderStage pushConstantStages = ShaderStage::None;
+
+    /// Formats of the attachments the pipeline renders to.
+    std::vector<Format> colorFormats;
+    Format depthFormat = Format::Undefined;
+
+    PrimitiveTopology topology = PrimitiveTopology::TriangleList;
+    CullMode cullMode = CullMode::Back;
+    FrontFace frontFace = FrontFace::CounterClockwise;
+    bool depthTest = true;
+    bool depthWrite = true;
+    CompareOp depthCompare = CompareOp::Less;
+    BlendMode blend = BlendMode::Opaque;
+
+    std::string debugName;
+};
+
+// --- Rendering -----------------------------------------------------------------
+
+enum class LoadOp : u8 { Load, Clear, DontCare };
+enum class StoreOp : u8 { Store, DontCare };
+
+struct ColorAttachment {
+    TextureHandle texture;
+    LoadOp loadOp = LoadOp::Clear;
+    StoreOp storeOp = StoreOp::Store;
+    std::array<f32, 4> clearColor{0.0f, 0.0f, 0.0f, 1.0f};
+};
+
+struct DepthAttachment {
+    TextureHandle texture;
+    LoadOp loadOp = LoadOp::Clear;
+    StoreOp storeOp = StoreOp::DontCare;
+    f32 clearDepth = 1.0f;
+};
+
+/// Targets of a render pass. There are no persistent render-pass or
+/// framebuffer objects: attachments are named when rendering begins.
+struct RenderingDesc {
+    std::span<const ColorAttachment> colorAttachments;
+    const DepthAttachment* depthAttachment = nullptr;
+};
+
+struct Viewport {
+    f32 x = 0.0f;
+    f32 y = 0.0f;
+    f32 width = 0.0f;
+    f32 height = 0.0f;
+    f32 minDepth = 0.0f;
+    f32 maxDepth = 1.0f;
+};
+
+struct Rect {
+    i32 x = 0;
+    i32 y = 0;
+    u32 width = 0;
+    u32 height = 0;
+};
+
+enum class IndexType : u8 { UInt16, UInt32 };
+
+// --- Swapchain & device --------------------------------------------------------
+
+struct SwapchainDesc {
+    platform::IWindow* window = nullptr;
+    bool vsync = true;
+};
+
+struct DeviceInfo {
+    std::string backend;     ///< "vulkan", "null"...
+    std::string deviceName;  ///< Adapter name as reported by the driver.
+    std::string apiVersion;
+    bool validationEnabled = false;
+};
+
+struct FrameStats {
+    u32 drawCalls = 0;
+    u64 triangles = 0;
+};
+
+}  // namespace bdex::rhi
