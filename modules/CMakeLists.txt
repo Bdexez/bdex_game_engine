@@ -9,3 +9,7 @@ endif()
 if(BDEX_MODULE_WINDOW_GLFW)
     add_subdirectory(window_glfw)
 endif()
+
+if(BDEX_MODULE_RHI_NULL)
+    add_subdirectory(rhi_null)
+endif()

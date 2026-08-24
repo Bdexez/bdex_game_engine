@@ -32,7 +32,7 @@ target_link_libraries(bdex_tests PRIVATE
     GTest::gtest
     GTest::gtest_main)
 bdex_configure_target(bdex_tests)
-bdex_target_modules(bdex_tests test_plugin window_null)
+bdex_target_modules(bdex_tests test_plugin window_null rhi_null)
 
 gtest_discover_tests(bdex_tests
     WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
