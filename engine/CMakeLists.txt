@@ -4,3 +4,4 @@ add_subdirectory(core)      # kernel: modules, services, events, scheduler, jobs
 add_subdirectory(ecs)       # entity-component-system
 add_subdirectory(platform)  # window / input interfaces
 add_subdirectory(rhi)       # render hardware interface (backend-agnostic)
+add_subdirectory(assets)    # CPU-side asset data, loaders, asset manager
