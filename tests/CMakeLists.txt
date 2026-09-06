@@ -22,7 +22,8 @@ add_executable(bdex_tests
     core/SchedulerTests.cpp
     core/ServiceRegistryTests.cpp
     core/TypeIdTests.cpp
-    ecs/WorldTests.cpp)
+    ecs/WorldTests.cpp
+    assets/AssetTests.cpp)
 target_include_directories(bdex_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(bdex_tests PRIVATE
     bdex::core
