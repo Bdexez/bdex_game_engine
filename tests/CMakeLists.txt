@@ -23,7 +23,8 @@ add_executable(bdex_tests
     core/ServiceRegistryTests.cpp
     core/TypeIdTests.cpp
     ecs/WorldTests.cpp
-    assets/AssetTests.cpp)
+    assets/AssetTests.cpp
+    scene/SceneTests.cpp)
 target_include_directories(bdex_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(bdex_tests PRIVATE
     bdex::core
@@ -31,6 +32,8 @@ target_link_libraries(bdex_tests PRIVATE
     bdex::platform
     bdex::rhi
     bdex::assets
+    bdex::scene
+    bdex::render
     GTest::gtest
     GTest::gtest_main)
 bdex_configure_target(bdex_tests)
