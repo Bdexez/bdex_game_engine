@@ -13,3 +13,7 @@ endif()
 if(BDEX_MODULE_RHI_NULL)
     add_subdirectory(rhi_null)
 endif()
+
+if(BDEX_MODULE_RHI_VULKAN)
+    add_subdirectory(rhi_vulkan)
+endif()
