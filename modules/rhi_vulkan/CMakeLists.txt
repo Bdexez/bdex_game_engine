@@ -23,6 +23,7 @@ add_library(bdex_vulkan_objects OBJECT
     src/VmaImplementation.cpp
     src/VulkanCommandList.cpp
     src/VulkanCommon.cpp
+    src/VulkanDevice.cpp
 )
 target_include_directories(bdex_vulkan_objects PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(bdex_vulkan_objects PRIVATE
