@@ -330,4 +330,306 @@ Result<> Device::createLogicalDevice(const DeviceConfig& config) {
     return {};
 }
 
+void Device::createFrameResources() {
+    VkCommandPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.queueFamilyIndex = queueFamily_;
+
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+
+    const auto allocateCommandBuffer = [this](VkCommandPool pool) {
+        VkCommandBufferAllocateInfo allocateInfo{};
+        allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocateInfo.commandPool = pool;
+        allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocateInfo.commandBufferCount = 1;
+        VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+        BDEX_VK_CHECK(vkAllocateCommandBuffers(device_, &allocateInfo, &commandBuffer));
+        return commandBuffer;
+    };
+
+    for (FrameData& frame : frames_) {
+        BDEX_VK_CHECK(vkCreateCommandPool(device_, &poolInfo, nullptr, &frame.pool));
+        frame.commandBuffer = allocateCommandBuffer(frame.pool);
+        // Created signaled so the very first beginFrame does not block.
+        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        BDEX_VK_CHECK(vkCreateFence(device_, &fenceInfo, nullptr, &frame.fence));
+    }
+
+    BDEX_VK_CHECK(vkCreateCommandPool(device_, &poolInfo, nullptr, &immediatePool_));
+    immediateCommandBuffer_ = allocateCommandBuffer(immediatePool_);
+    fenceInfo.flags = 0;
+    BDEX_VK_CHECK(vkCreateFence(device_, &fenceInfo, nullptr, &immediateFence_));
+}
+
+Device::~Device() {
+    if (device_ != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(device_);
+
+        // Swapchains first: they own textures.
+        std::vector<rhi::SwapchainHandle> swapchains;
+        swapchains_.forEach([&](rhi::SwapchainHandle handle, Swapchain&) {
+            swapchains.push_back(handle);
+        });
+        for (const rhi::SwapchainHandle handle : swapchains) {
+            destroySwapchain(handle);
+        }
+
+        // Anything still alive was leaked by its owner; release it and say so.
+        const usize leaked = buffers_.size() + textures_.size() + samplers_.size() +
+                             shaders_.size() + bindGroupLayouts_.size() + bindGroups_.size() +
+                             pipelines_.size();
+        if (leaked != 0) {
+            log::warn("vulkan", "{} resource(s) were never destroyed", leaked);
+        }
+        const auto collect = [](auto& pool) {
+            std::vector<typename std::remove_reference_t<decltype(pool)>::HandleType> handles;
+            pool.forEach([&](auto handle, auto&) { handles.push_back(handle); });
+            return handles;
+        };
+        for (const auto handle : collect(pipelines_)) destroyPipeline(handle);
+        for (const auto handle : collect(bindGroups_)) destroyBindGroup(handle);
+        for (const auto handle : collect(bindGroupLayouts_)) destroyBindGroupLayout(handle);
+        for (const auto handle : collect(shaders_)) destroyShader(handle);
+        for (const auto handle : collect(samplers_)) destroySampler(handle);
+        for (const auto handle : collect(textures_)) destroyTexture(handle);
+        for (const auto handle : collect(buffers_)) destroyBuffer(handle);
+        flushAllDeferred();
+
+        if (descriptorPool_ != VK_NULL_HANDLE) {
+            vkDestroyDescriptorPool(device_, descriptorPool_, nullptr);
+        }
+        for (FrameData& frame : frames_) {
+            if (frame.fence != VK_NULL_HANDLE) vkDestroyFence(device_, frame.fence, nullptr);
+            if (frame.pool != VK_NULL_HANDLE) vkDestroyCommandPool(device_, frame.pool, nullptr);
+        }
+        if (immediateFence_ != VK_NULL_HANDLE) vkDestroyFence(device_, immediateFence_, nullptr);
+        if (immediatePool_ != VK_NULL_HANDLE) {
+            vkDestroyCommandPool(device_, immediatePool_, nullptr);
+        }
+        if (allocator_ != VK_NULL_HANDLE) {
+            vmaDestroyAllocator(allocator_);
+        }
+        vkDestroyDevice(device_, nullptr);
+    }
+
+    if (instance_ != VK_NULL_HANDLE) {
+        if (messenger_ != VK_NULL_HANDLE && destroyMessenger_ != nullptr) {
+            destroyMessenger_(instance_, messenger_, nullptr);
+        }
+        vkDestroyInstance(instance_, nullptr);
+    }
+}
+
+rhi::DeviceInfo Device::info() const {
+    return rhi::DeviceInfo{"vulkan", adapterName_, versionString(adapterApiVersion_),
+                           validationEnabled_};
+}
+
+VKAPI_ATTR VkBool32 VKAPI_CALL Device::debugCallback(
+    VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT /*types*/,
+    const VkDebugUtilsMessengerCallbackDataEXT* data, void* userData) {
+    auto* self = static_cast<Device*>(userData);
+    const char* message = data != nullptr && data->pMessage != nullptr ? data->pMessage : "";
+    if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0) {
+        self->validationErrors_.fetch_add(1, std::memory_order_relaxed);
+        log::error("vulkan", "{}", message);
+    } else {
+        log::warn("vulkan", "{}", message);
+    }
+    return VK_FALSE;
+}
+
+void Device::setDebugName(VkObjectType type, u64 handle, const std::string& name) {
+    if (setObjectName_ == nullptr || name.empty() || handle == 0) {
+        return;
+    }
+    VkDebugUtilsObjectNameInfoEXT info{};
+    info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
+    info.objectType = type;
+    info.objectHandle = handle;
+    info.pObjectName = name.c_str();
+    setObjectName_(device_, &info);
+}
+
+void Device::beginDebugLabel(VkCommandBuffer commandBuffer, std::string_view name) {
+    if (cmdBeginLabel_ == nullptr) {
+        return;
+    }
+    const std::string label(name);
+    VkDebugUtilsLabelEXT info{};
+    info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+    info.pLabelName = label.c_str();
+    cmdBeginLabel_(commandBuffer, &info);
+}
+
+void Device::endDebugLabel(VkCommandBuffer commandBuffer) {
+    if (cmdEndLabel_ != nullptr) {
+        cmdEndLabel_(commandBuffer);
+    }
+}
+
+// =============================================================================
+// Deferred release & one-off submissions
+// =============================================================================
+
+void Device::defer(std::function<void()> release) {
+    // The object may be referenced by the frame being recorded (or, outside of
+    // a frame, by the last one submitted - tagging it with the upcoming frame
+    // is conservative and keeps a single rule).
+    deferred_.push_back({frameNumber_, std::move(release)});
+}
+
+void Device::flushDeferred(u64 completedFrame) {
+    while (!deferred_.empty() && deferred_.front().frame <= completedFrame) {
+        deferred_.front().release();
+        deferred_.pop_front();
+    }
+}
+
+void Device::flushAllDeferred() {
+    while (!deferred_.empty()) {
+        deferred_.front().release();
+        deferred_.pop_front();
+    }
+}
+
+void Device::immediateSubmit(const std::function<void(VkCommandBuffer)>& record) {
+    BDEX_VK_CHECK(vkResetCommandPool(device_, immediatePool_, 0));
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    BDEX_VK_CHECK(vkBeginCommandBuffer(immediateCommandBuffer_, &beginInfo));
+    record(immediateCommandBuffer_);
+    BDEX_VK_CHECK(vkEndCommandBuffer(immediateCommandBuffer_));
+
+    VkCommandBufferSubmitInfo commandInfo{};
+    commandInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    commandInfo.commandBuffer = immediateCommandBuffer_;
+    VkSubmitInfo2 submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &commandInfo;
+    BDEX_VK_CHECK(vkQueueSubmit2(queue_, 1, &submitInfo, immediateFence_));
+    BDEX_VK_CHECK(vkWaitForFences(device_, 1, &immediateFence_, VK_TRUE, UINT64_MAX));
+    BDEX_VK_CHECK(vkResetFences(device_, 1, &immediateFence_));
+}
+
+void Device::transition(VkCommandBuffer commandBuffer, Texture& texture, VkImageLayout layout) {
+    if (texture.layout == layout) {
+        return;
+    }
+    const LayoutSync source = layoutSync(texture.layout);
+    const LayoutSync destination = layoutSync(layout);
+
+    VkImageMemoryBarrier2 barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = source.stage;
+    barrier.srcAccessMask = source.access;
+    barrier.dstStageMask = destination.stage;
+    barrier.dstAccessMask = destination.access;
+    barrier.oldLayout = texture.layout;
+    barrier.newLayout = layout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = texture.image;
+    barrier.subresourceRange = {aspectMask(texture.desc.format), 0, 1, 0, 1};
+
+    VkDependencyInfo dependency{};
+    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency.imageMemoryBarrierCount = 1;
+    dependency.pImageMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(commandBuffer, &dependency);
+
+    texture.layout = layout;
+}
+
+// =============================================================================
+// Buffers
+// =============================================================================
+
+rhi::BufferHandle Device::createBuffer(const rhi::BufferDesc& desc) {
+    BDEX_ASSERT(desc.size > 0, "cannot create an empty buffer");
+
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = desc.size;
+    bufferInfo.usage = toVkBufferUsage(desc.usage);
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo allocationInfo{};
+    allocationInfo.usage = VMA_MEMORY_USAGE_AUTO;
+    switch (desc.memory) {
+        case rhi::MemoryUsage::GpuOnly:
+            // Filled through a staging copy.
+            bufferInfo.usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            allocationInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+            break;
+        case rhi::MemoryUsage::CpuToGpu:
+            allocationInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                                   VMA_ALLOCATION_CREATE_MAPPED_BIT;
+            break;
+        case rhi::MemoryUsage::GpuToCpu:
+            allocationInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                                   VMA_ALLOCATION_CREATE_MAPPED_BIT;
+            break;
+    }
+
+    Buffer buffer;
+    buffer.desc = desc;
+    VmaAllocationInfo allocated{};
+    BDEX_VK_CHECK(vmaCreateBuffer(allocator_, &bufferInfo, &allocationInfo, &buffer.handle,
+                                  &buffer.allocation, &allocated));
+    buffer.mapped = allocated.pMappedData;
+    setDebugName(VK_OBJECT_TYPE_BUFFER, handleToU64(buffer.handle), desc.debugName);
+    return buffers_.insert(std::move(buffer));
+}
+
+void Device::destroyBuffer(rhi::BufferHandle handle) {
+    if (const auto buffer = buffers_.take(handle)) {
+        defer([allocator = allocator_, vkBuffer = buffer->handle,
+               allocation = buffer->allocation] {
+            vmaDestroyBuffer(allocator, vkBuffer, allocation);
+        });
+    }
+}
+
+void Device::writeBuffer(rhi::BufferHandle handle, std::span<const std::byte> data, u64 offset) {
+    Buffer* buffer = buffers_.get(handle);
+    BDEX_ASSERT(buffer != nullptr, "writeBuffer on an invalid buffer");
+    BDEX_ASSERT(offset + data.size() <= buffer->desc.size, "writeBuffer out of bounds");
+    if (data.empty()) {
+        return;
+    }
+
+    if (buffer->mapped != nullptr) {
+        std::memcpy(static_cast<std::byte*>(buffer->mapped) + offset, data.data(), data.size());
+        BDEX_VK_CHECK(vmaFlushAllocation(allocator_, buffer->allocation, offset, data.size()));
+        return;
+    }
+
+    // Device-local buffer: go through a temporary host-visible buffer.
+    rhi::BufferDesc stagingDesc;
+    stagingDesc.size = data.size();
+    stagingDesc.usage = rhi::BufferUsage::TransferSrc;
+    stagingDesc.memory = rhi::MemoryUsage::CpuToGpu;
+    const rhi::BufferHandle stagingHandle = createBuffer(stagingDesc);
+    const Buffer* staging = buffers_.get(stagingHandle);
+    buffer = buffers_.get(handle);  // the pool may have been reallocated
+    std::memcpy(staging->mapped, data.data(), data.size());
+    BDEX_VK_CHECK(vmaFlushAllocation(allocator_, staging->allocation, 0, data.size()));
+
+    immediateSubmit([&](VkCommandBuffer commandBuffer) {
+        const VkBufferCopy region{0, offset, data.size()};
+        vkCmdCopyBuffer(commandBuffer, staging->handle, buffer->handle, 1, &region);
+    });
+    destroyBuffer(stagingHandle);
+}
+
+// =============================================================================
+// Textures & samplers
+// =============================================================================
+
 }  // namespace bdex::vulkan
