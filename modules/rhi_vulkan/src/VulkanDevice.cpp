@@ -632,4 +632,191 @@ void Device::writeBuffer(rhi::BufferHandle handle, std::span<const std::byte> da
 // Textures & samplers
 // =============================================================================
 
+rhi::TextureHandle Device::createTexture(const rhi::TextureDesc& desc) {
+    BDEX_ASSERT(desc.width > 0 && desc.height > 0, "cannot create an empty texture");
+    BDEX_ASSERT(desc.format != rhi::Format::Undefined, "texture format is undefined");
+
+    Texture texture;
+    texture.desc = desc;
+    texture.format = toVkFormat(desc.format);
+
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = texture.format;
+    imageInfo.extent = {desc.width, desc.height, 1};
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = toVkImageUsage(desc.usage);
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (hasFlag(desc.usage, rhi::TextureUsage::Sampled)) {
+        imageInfo.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;  // writeTexture
+    }
+
+    VmaAllocationCreateInfo allocationInfo{};
+    allocationInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    BDEX_VK_CHECK(vmaCreateImage(allocator_, &imageInfo, &allocationInfo, &texture.image,
+                                 &texture.allocation, nullptr));
+
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = texture.image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = texture.format;
+    viewInfo.subresourceRange = {aspectMask(desc.format), 0, 1, 0, 1};
+    BDEX_VK_CHECK(vkCreateImageView(device_, &viewInfo, nullptr, &texture.view));
+
+    setDebugName(VK_OBJECT_TYPE_IMAGE, handleToU64(texture.image), desc.debugName);
+    setDebugName(VK_OBJECT_TYPE_IMAGE_VIEW, handleToU64(texture.view), desc.debugName);
+    return textures_.insert(std::move(texture));
+}
+
+void Device::destroyTexture(rhi::TextureHandle handle) {
+    const Texture* existing = textures_.get(handle);
+    if (existing == nullptr || existing->swapchainImage) {
+        return;  // swapchain images belong to their swapchain
+    }
+    const auto texture = textures_.take(handle);
+    defer([device = device_, allocator = allocator_, image = texture->image, view = texture->view,
+           allocation = texture->allocation] {
+        vkDestroyImageView(device, view, nullptr);
+        vmaDestroyImage(allocator, image, allocation);
+    });
+}
+
+void Device::writeTexture(rhi::TextureHandle handle, std::span<const std::byte> pixels) {
+    {
+        const Texture* texture = textures_.get(handle);
+        BDEX_ASSERT(texture != nullptr, "writeTexture on an invalid texture");
+        BDEX_ASSERT(pixels.size() == static_cast<usize>(texture->desc.width) *
+                                         texture->desc.height *
+                                         rhi::bytesPerPixel(texture->desc.format),
+                    "writeTexture size mismatch");
+    }
+
+    rhi::BufferDesc stagingDesc;
+    stagingDesc.size = pixels.size();
+    stagingDesc.usage = rhi::BufferUsage::TransferSrc;
+    stagingDesc.memory = rhi::MemoryUsage::CpuToGpu;
+    const rhi::BufferHandle stagingHandle = createBuffer(stagingDesc);
+    const Buffer* staging = buffers_.get(stagingHandle);
+    std::memcpy(staging->mapped, pixels.data(), pixels.size());
+    BDEX_VK_CHECK(vmaFlushAllocation(allocator_, staging->allocation, 0, pixels.size()));
+
+    Texture* texture = textures_.get(handle);
+    immediateSubmit([&](VkCommandBuffer commandBuffer) {
+        transition(commandBuffer, *texture, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+        VkBufferImageCopy region{};
+        region.imageSubresource = {aspectMask(texture->desc.format), 0, 0, 1};
+        region.imageExtent = {texture->desc.width, texture->desc.height, 1};
+        vkCmdCopyBufferToImage(commandBuffer, staging->handle, texture->image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        if (hasFlag(texture->desc.usage, rhi::TextureUsage::Sampled)) {
+            transition(commandBuffer, *texture, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        }
+    });
+    destroyBuffer(stagingHandle);
+}
+
+std::vector<u8> Device::readTexture(rhi::TextureHandle handle) {
+    BDEX_ASSERT(!inFrame_, "readTexture must not be called while recording a frame");
+    {
+        const Texture* texture = textures_.get(handle);
+        BDEX_ASSERT(texture != nullptr, "readTexture on an invalid texture");
+        BDEX_ASSERT(hasFlag(texture->desc.usage, rhi::TextureUsage::TransferSrc),
+                    "readTexture requires TextureUsage::TransferSrc");
+        BDEX_ASSERT(!rhi::isDepthFormat(texture->desc.format) &&
+                        rhi::bytesPerPixel(texture->desc.format) == 4,
+                    "readTexture supports 8-bit color formats only");
+    }
+
+    // The frames that rendered to the texture must have finished.
+    waitIdle();
+
+    const rhi::TextureDesc desc = textures_.get(handle)->desc;
+    const usize byteCount = static_cast<usize>(desc.width) * desc.height * 4;
+
+    rhi::BufferDesc readbackDesc;
+    readbackDesc.size = byteCount;
+    readbackDesc.usage = rhi::BufferUsage::TransferDst;
+    readbackDesc.memory = rhi::MemoryUsage::GpuToCpu;
+    const rhi::BufferHandle readbackHandle = createBuffer(readbackDesc);
+    const Buffer* readback = buffers_.get(readbackHandle);
+
+    Texture* texture = textures_.get(handle);
+    immediateSubmit([&](VkCommandBuffer commandBuffer) {
+        const VkImageLayout previous = texture->layout;
+        transition(commandBuffer, *texture, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {desc.width, desc.height, 1};
+        vkCmdCopyImageToBuffer(commandBuffer, texture->image,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->handle, 1, &region);
+
+        if (previous != VK_IMAGE_LAYOUT_UNDEFINED) {
+            transition(commandBuffer, *texture, previous);
+        }
+    });
+
+    BDEX_VK_CHECK(vmaInvalidateAllocation(allocator_, readback->allocation, 0, byteCount));
+    std::vector<u8> pixels(byteCount);
+    std::memcpy(pixels.data(), readback->mapped, byteCount);
+    destroyBuffer(readbackHandle);
+
+    // Always hand back RGBA, whatever the channel order of the texture.
+    if (desc.format == rhi::Format::BGRA8Unorm || desc.format == rhi::Format::BGRA8Srgb) {
+        for (usize i = 0; i < byteCount; i += 4) {
+            std::swap(pixels[i], pixels[i + 2]);
+        }
+    }
+    return pixels;
+}
+
+rhi::TextureDesc Device::textureDesc(rhi::TextureHandle handle) const {
+    if (const Texture* texture = textures_.get(handle)) {
+        return texture->desc;
+    }
+    rhi::TextureDesc invalid;
+    invalid.width = 0;
+    invalid.height = 0;
+    invalid.format = rhi::Format::Undefined;
+    invalid.usage = rhi::TextureUsage::None;
+    return invalid;
+}
+
+rhi::SamplerHandle Device::createSampler(const rhi::SamplerDesc& desc) {
+    VkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.minFilter = toVkFilter(desc.minFilter);
+    samplerInfo.magFilter = toVkFilter(desc.magFilter);
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerInfo.addressModeU = toVkAddressMode(desc.addressMode);
+    samplerInfo.addressModeV = toVkAddressMode(desc.addressMode);
+    samplerInfo.addressModeW = toVkAddressMode(desc.addressMode);
+    samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
+
+    Sampler sampler;
+    BDEX_VK_CHECK(vkCreateSampler(device_, &samplerInfo, nullptr, &sampler.handle));
+    setDebugName(VK_OBJECT_TYPE_SAMPLER, handleToU64(sampler.handle), desc.debugName);
+    return samplers_.insert(sampler);
+}
+
+void Device::destroySampler(rhi::SamplerHandle handle) {
+    if (const auto sampler = samplers_.take(handle)) {
+        defer([device = device_, vkSampler = sampler->handle] {
+            vkDestroySampler(device, vkSampler, nullptr);
+        });
+    }
+}
+
+// =============================================================================
+// Shaders, bind groups, pipelines
+// =============================================================================
+
 }  // namespace bdex::vulkan
