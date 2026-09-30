@@ -819,4 +819,296 @@ void Device::destroySampler(rhi::SamplerHandle handle) {
 // Shaders, bind groups, pipelines
 // =============================================================================
 
+rhi::ShaderHandle Device::createShader(const rhi::ShaderDesc& desc) {
+    BDEX_ASSERT(!desc.spirv.empty(), "shader has no SPIR-V code");
+
+    VkShaderModuleCreateInfo moduleInfo{};
+    moduleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    moduleInfo.codeSize = desc.spirv.size_bytes();
+    moduleInfo.pCode = desc.spirv.data();
+
+    Shader shader;
+    shader.stage = desc.stage;
+    shader.entryPoint = desc.entryPoint;
+    BDEX_VK_CHECK(vkCreateShaderModule(device_, &moduleInfo, nullptr, &shader.module));
+    setDebugName(VK_OBJECT_TYPE_SHADER_MODULE, handleToU64(shader.module), desc.debugName);
+    return shaders_.insert(std::move(shader));
+}
+
+void Device::destroyShader(rhi::ShaderHandle handle) {
+    if (const auto shader = shaders_.take(handle)) {
+        // Pipelines keep no reference to the module once created.
+        vkDestroyShaderModule(device_, shader->module, nullptr);
+    }
+}
+
+rhi::BindGroupLayoutHandle Device::createBindGroupLayout(const rhi::BindGroupLayoutDesc& desc) {
+    std::vector<VkDescriptorSetLayoutBinding> bindings;
+    bindings.reserve(desc.entries.size());
+    for (const rhi::BindGroupLayoutEntry& entry : desc.entries) {
+        VkDescriptorSetLayoutBinding binding{};
+        binding.binding = entry.binding;
+        binding.descriptorType = toVkDescriptorType(entry.type);
+        binding.descriptorCount = 1;
+        binding.stageFlags = toVkShaderStages(entry.stages);
+        bindings.push_back(binding);
+    }
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = static_cast<u32>(bindings.size());
+    layoutInfo.pBindings = bindings.data();
+
+    BindGroupLayout layout;
+    layout.desc = desc;
+    BDEX_VK_CHECK(vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &layout.handle));
+    setDebugName(VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, handleToU64(layout.handle), desc.debugName);
+    return bindGroupLayouts_.insert(std::move(layout));
+}
+
+void Device::destroyBindGroupLayout(rhi::BindGroupLayoutHandle handle) {
+    if (const auto layout = bindGroupLayouts_.take(handle)) {
+        defer([device = device_, vkLayout = layout->handle] {
+            vkDestroyDescriptorSetLayout(device, vkLayout, nullptr);
+        });
+    }
+}
+
+rhi::BindGroupHandle Device::createBindGroup(const rhi::BindGroupDesc& desc) {
+    const BindGroupLayout* layout = bindGroupLayouts_.get(desc.layout);
+    BDEX_ASSERT(layout != nullptr, "bind group created with an invalid layout");
+
+    VkDescriptorSetAllocateInfo allocateInfo{};
+    allocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocateInfo.descriptorPool = descriptorPool_;
+    allocateInfo.descriptorSetCount = 1;
+    allocateInfo.pSetLayouts = &layout->handle;
+
+    BindGroup group;
+    BDEX_VK_CHECK(vkAllocateDescriptorSets(device_, &allocateInfo, &group.handle));
+    setDebugName(VK_OBJECT_TYPE_DESCRIPTOR_SET, handleToU64(group.handle), desc.debugName);
+
+    // Reserve up front: the write structs point into these arrays.
+    std::vector<VkDescriptorBufferInfo> bufferInfos;
+    std::vector<VkDescriptorImageInfo> imageInfos;
+    std::vector<VkWriteDescriptorSet> writes;
+    bufferInfos.reserve(desc.entries.size());
+    imageInfos.reserve(desc.entries.size());
+    writes.reserve(desc.entries.size());
+
+    for (const rhi::BindGroupEntry& entry : desc.entries) {
+        const auto declared =
+            std::find_if(layout->desc.entries.begin(), layout->desc.entries.end(),
+                         [&](const auto& candidate) { return candidate.binding == entry.binding; });
+        BDEX_ASSERT(declared != layout->desc.entries.end(),
+                    "bind group entry is not declared in its layout");
+
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = group.handle;
+        write.dstBinding = entry.binding;
+        write.descriptorCount = 1;
+        write.descriptorType = toVkDescriptorType(declared->type);
+
+        if (declared->type == rhi::BindingType::CombinedTextureSampler) {
+            const Texture* texture = textures_.get(entry.texture);
+            const Sampler* sampler = samplers_.get(entry.sampler);
+            BDEX_ASSERT(texture != nullptr && sampler != nullptr,
+                        "bind group entry needs a valid texture and sampler");
+            imageInfos.push_back(
+                {sampler->handle, texture->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+            write.pImageInfo = &imageInfos.back();
+        } else {
+            const Buffer* buffer = buffers_.get(entry.buffer);
+            BDEX_ASSERT(buffer != nullptr, "bind group entry needs a valid buffer");
+            bufferInfos.push_back({buffer->handle, entry.offset,
+                                   entry.size == rhi::kWholeSize ? VK_WHOLE_SIZE : entry.size});
+            write.pBufferInfo = &bufferInfos.back();
+        }
+        writes.push_back(write);
+    }
+    vkUpdateDescriptorSets(device_, static_cast<u32>(writes.size()), writes.data(), 0, nullptr);
+    return bindGroups_.insert(group);
+}
+
+void Device::destroyBindGroup(rhi::BindGroupHandle handle) {
+    if (const auto group = bindGroups_.take(handle)) {
+        defer([device = device_, pool = descriptorPool_, set = group->handle] {
+            vkFreeDescriptorSets(device, pool, 1, &set);
+        });
+    }
+}
+
+rhi::PipelineHandle Device::createGraphicsPipeline(const rhi::GraphicsPipelineDesc& desc) {
+    const Shader* vertexShader = shaders_.get(desc.vertexShader);
+    const Shader* fragmentShader = shaders_.get(desc.fragmentShader);
+    BDEX_ASSERT(vertexShader != nullptr && fragmentShader != nullptr,
+                "pipeline created with invalid shaders");
+
+    Pipeline pipeline;
+    pipeline.pushConstantStages = toVkShaderStages(desc.pushConstantStages);
+
+    // --- Layout ------------------------------------------------------------------
+    std::vector<VkDescriptorSetLayout> setLayouts;
+    for (const rhi::BindGroupLayoutHandle handle : desc.bindGroupLayouts) {
+        const BindGroupLayout* layout = bindGroupLayouts_.get(handle);
+        BDEX_ASSERT(layout != nullptr, "pipeline created with an invalid bind group layout");
+        setLayouts.push_back(layout->handle);
+    }
+    const VkPushConstantRange pushConstantRange{pipeline.pushConstantStages, 0,
+                                                desc.pushConstantSize};
+    VkPipelineLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layoutInfo.setLayoutCount = static_cast<u32>(setLayouts.size());
+    layoutInfo.pSetLayouts = setLayouts.data();
+    if (desc.pushConstantSize > 0) {
+        BDEX_ASSERT(pipeline.pushConstantStages != 0, "push constants need at least one stage");
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &pushConstantRange;
+    } else {
+        pipeline.pushConstantStages = 0;
+    }
+    BDEX_VK_CHECK(vkCreatePipelineLayout(device_, &layoutInfo, nullptr, &pipeline.layout));
+
+    // --- Stages ------------------------------------------------------------------
+    std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vertexShader->module;
+    stages[0].pName = vertexShader->entryPoint.c_str();
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fragmentShader->module;
+    stages[1].pName = fragmentShader->entryPoint.c_str();
+
+    // --- Fixed-function state ------------------------------------------------------
+    const VkVertexInputBindingDescription vertexBinding{0, desc.vertexLayout.stride,
+                                                        VK_VERTEX_INPUT_RATE_VERTEX};
+    std::vector<VkVertexInputAttributeDescription> vertexAttributes;
+    for (const rhi::VertexAttribute& attribute : desc.vertexLayout.attributes) {
+        vertexAttributes.push_back(
+            {attribute.location, 0, toVkVertexFormat(attribute.format), attribute.offset});
+    }
+    VkPipelineVertexInputStateCreateInfo vertexInput{};
+    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    if (desc.vertexLayout.stride > 0) {
+        vertexInput.vertexBindingDescriptionCount = 1;
+        vertexInput.pVertexBindingDescriptions = &vertexBinding;
+        vertexInput.vertexAttributeDescriptionCount = static_cast<u32>(vertexAttributes.size());
+        vertexInput.pVertexAttributeDescriptions = vertexAttributes.data();
+    }
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+    inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = toVkTopology(desc.topology);
+
+    // Viewport and scissor are dynamic: pipelines survive window resizes.
+    VkPipelineViewportStateCreateInfo viewportState{};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rasterization{};
+    rasterization.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterization.cullMode = toVkCullMode(desc.cullMode);
+    rasterization.frontFace = toVkFrontFace(desc.frontFace);
+    rasterization.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo multisample{};
+    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    const bool hasDepth = desc.depthFormat != rhi::Format::Undefined;
+    VkPipelineDepthStencilStateCreateInfo depthStencil{};
+    depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable = hasDepth && desc.depthTest ? VK_TRUE : VK_FALSE;
+    depthStencil.depthWriteEnable = hasDepth && desc.depthWrite ? VK_TRUE : VK_FALSE;
+    depthStencil.depthCompareOp = toVkCompareOp(desc.depthCompare);
+
+    VkPipelineColorBlendAttachmentState blendAttachment{};
+    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                     VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    switch (desc.blend) {
+        case rhi::BlendMode::Opaque: break;
+        case rhi::BlendMode::AlphaBlend:
+            blendAttachment.blendEnable = VK_TRUE;
+            blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+            blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            blendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+            blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            blendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+            break;
+        case rhi::BlendMode::Additive:
+            blendAttachment.blendEnable = VK_TRUE;
+            blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+            blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+            blendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+            blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            blendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+            break;
+    }
+    const std::vector<VkPipelineColorBlendAttachmentState> blendAttachments(
+        desc.colorFormats.size(), blendAttachment);
+    VkPipelineColorBlendStateCreateInfo colorBlend{};
+    colorBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlend.attachmentCount = static_cast<u32>(blendAttachments.size());
+    colorBlend.pAttachments = blendAttachments.data();
+
+    const std::array<VkDynamicState, 2> dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT,
+                                                         VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState{};
+    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = static_cast<u32>(dynamicStates.size());
+    dynamicState.pDynamicStates = dynamicStates.data();
+
+    // Dynamic rendering: attachment formats replace the render pass object.
+    std::vector<VkFormat> colorFormats;
+    for (const rhi::Format format : desc.colorFormats) {
+        colorFormats.push_back(toVkFormat(format));
+    }
+    VkPipelineRenderingCreateInfo renderingInfo{};
+    renderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    renderingInfo.colorAttachmentCount = static_cast<u32>(colorFormats.size());
+    renderingInfo.pColorAttachmentFormats = colorFormats.data();
+    renderingInfo.depthAttachmentFormat = toVkFormat(desc.depthFormat);
+    renderingInfo.stencilAttachmentFormat =
+        rhi::hasStencil(desc.depthFormat) ? toVkFormat(desc.depthFormat) : VK_FORMAT_UNDEFINED;
+
+    VkGraphicsPipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.pNext = &renderingInfo;
+    pipelineInfo.stageCount = static_cast<u32>(stages.size());
+    pipelineInfo.pStages = stages.data();
+    pipelineInfo.pVertexInputState = &vertexInput;
+    pipelineInfo.pInputAssemblyState = &inputAssembly;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterization;
+    pipelineInfo.pMultisampleState = &multisample;
+    pipelineInfo.pDepthStencilState = &depthStencil;
+    pipelineInfo.pColorBlendState = &colorBlend;
+    pipelineInfo.pDynamicState = &dynamicState;
+    pipelineInfo.layout = pipeline.layout;
+    BDEX_VK_CHECK(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
+                                            &pipeline.handle));
+
+    setDebugName(VK_OBJECT_TYPE_PIPELINE, handleToU64(pipeline.handle), desc.debugName);
+    return pipelines_.insert(pipeline);
+}
+
+void Device::destroyPipeline(rhi::PipelineHandle handle) {
+    if (const auto pipeline = pipelines_.take(handle)) {
+        defer([device = device_, vkPipeline = pipeline->handle, layout = pipeline->layout] {
+            vkDestroyPipeline(device, vkPipeline, nullptr);
+            vkDestroyPipelineLayout(device, layout, nullptr);
+        });
+    }
+}
+
+// =============================================================================
+// Frame
+// =============================================================================
+
 }  // namespace bdex::vulkan
