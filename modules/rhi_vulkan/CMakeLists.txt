@@ -18,17 +18,20 @@ else()
         ${vulkanmemoryallocator_SOURCE_DIR}/include)
 endif()
 
-# Compile backend parts until the complete module can be linked.
-add_library(bdex_vulkan_objects OBJECT
-    src/VmaImplementation.cpp
-    src/VulkanCommandList.cpp
-    src/VulkanCommon.cpp
-    src/VulkanDevice.cpp
-)
-target_include_directories(bdex_vulkan_objects PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(bdex_vulkan_objects PRIVATE
-    bdex::core bdex::platform bdex::rhi Vulkan::Vulkan bdex_vma)
-bdex_configure_target(bdex_vulkan_objects)
+bdex_add_module(rhi_vulkan
+    SOURCES
+        src/VmaImplementation.cpp
+        src/VulkanCommandList.cpp
+        src/VulkanCommon.cpp
+        src/VulkanDevice.cpp
+        src/VulkanModule.cpp
+        src/VulkanSwapchain.cpp
+    DEPS
+        bdex::core
+        bdex::platform
+        bdex::rhi
+        Vulkan::Vulkan
+        bdex_vma)
 
 # Third-party implementation unit: not held to the engine's warning level.
 if(MSVC)

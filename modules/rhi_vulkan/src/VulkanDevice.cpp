@@ -1111,4 +1111,97 @@ void Device::destroyPipeline(rhi::PipelineHandle handle) {
 // Frame
 // =============================================================================
 
+rhi::ICommandList& Device::beginFrame() {
+    BDEX_ASSERT(!inFrame_, "beginFrame called twice");
+    FrameData& frame = frames_[frameSlot()];
+
+    // This slot was last used by frame N - kFramesInFlight: once its fence is
+    // signaled, everything up to that frame has left the GPU.
+    BDEX_VK_CHECK(vkWaitForFences(device_, 1, &frame.fence, VK_TRUE, UINT64_MAX));
+    BDEX_VK_CHECK(vkResetFences(device_, 1, &frame.fence));
+    if (frameNumber_ >= kFramesInFlight) {
+        flushDeferred(frameNumber_ - kFramesInFlight);
+    }
+
+    BDEX_VK_CHECK(vkResetCommandPool(device_, frame.pool, 0));
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    BDEX_VK_CHECK(vkBeginCommandBuffer(frame.commandBuffer, &beginInfo));
+
+    commandList_.begin(frame.commandBuffer);
+    inFrame_ = true;
+    return commandList_;
+}
+
+void Device::endFrame() {
+    BDEX_ASSERT(inFrame_, "endFrame without beginFrame");
+    FrameData& frame = frames_[frameSlot()];
+
+    std::vector<VkSemaphoreSubmitInfo> waits;
+    std::vector<VkSemaphoreSubmitInfo> signals;
+    for (const rhi::SwapchainHandle handle : acquired_) {
+        Swapchain* swapchain = swapchains_.get(handle);
+        Texture* image = textures_.get(swapchain->images[swapchain->imageIndex]);
+        transition(frame.commandBuffer, *image, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+
+        VkSemaphoreSubmitInfo wait{};
+        wait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+        wait.semaphore = swapchain->imageAvailable[frameSlot()];
+        // Block the whole command buffer until the image is ours: layout
+        // transitions of the swapchain image may be the very first command.
+        wait.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        waits.push_back(wait);
+
+        VkSemaphoreSubmitInfo signal{};
+        signal.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+        signal.semaphore = swapchain->renderFinished[swapchain->imageIndex];
+        signal.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        signals.push_back(signal);
+    }
+
+    lastStats_ = commandList_.stats();
+    commandList_.end();
+    BDEX_VK_CHECK(vkEndCommandBuffer(frame.commandBuffer));
+
+    VkCommandBufferSubmitInfo commandInfo{};
+    commandInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    commandInfo.commandBuffer = frame.commandBuffer;
+    VkSubmitInfo2 submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submitInfo.waitSemaphoreInfoCount = static_cast<u32>(waits.size());
+    submitInfo.pWaitSemaphoreInfos = waits.data();
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &commandInfo;
+    submitInfo.signalSemaphoreInfoCount = static_cast<u32>(signals.size());
+    submitInfo.pSignalSemaphoreInfos = signals.data();
+    BDEX_VK_CHECK(vkQueueSubmit2(queue_, 1, &submitInfo, frame.fence));
+
+    for (const rhi::SwapchainHandle handle : acquired_) {
+        Swapchain* swapchain = swapchains_.get(handle);
+        VkPresentInfoKHR presentInfo{};
+        presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        presentInfo.waitSemaphoreCount = 1;
+        presentInfo.pWaitSemaphores = &swapchain->renderFinished[swapchain->imageIndex];
+        presentInfo.swapchainCount = 1;
+        presentInfo.pSwapchains = &swapchain->handle;
+        presentInfo.pImageIndices = &swapchain->imageIndex;
+        const VkResult result = vkQueuePresentKHR(queue_, &presentInfo);
+        if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+            swapchain->outOfDate = true;  // rebuilt on the next acquire
+        } else if (result != VK_SUCCESS) {
+            log::error("vulkan", "vkQueuePresentKHR failed: {}", resultString(result));
+        }
+        swapchain->acquired = false;
+    }
+    acquired_.clear();
+
+    inFrame_ = false;
+    ++frameNumber_;
+}
+
+void Device::waitIdle() {
+    BDEX_VK_CHECK(vkDeviceWaitIdle(device_));
+}
+
 }  // namespace bdex::vulkan
