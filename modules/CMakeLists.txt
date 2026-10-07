@@ -17,3 +17,7 @@ endif()
 if(BDEX_MODULE_RHI_VULKAN)
     add_subdirectory(rhi_vulkan)
 endif()
+
+if(BDEX_MODULE_RENDERER_FORWARD)
+    add_subdirectory(renderer_forward)
+endif()
