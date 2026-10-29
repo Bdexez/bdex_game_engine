@@ -1,0 +1,11 @@
+bdex_add_library(app
+    SOURCES
+        src/Application.cpp
+    PUBLIC_DEPS
+        bdex::core
+        bdex::ecs
+        bdex::platform
+        bdex::rhi
+        bdex::assets
+        bdex::scene
+        bdex::render)
