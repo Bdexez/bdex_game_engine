@@ -1,0 +1,72 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "binaryDir": "${sourceDir}/build-${presetName}"
+        },
+        {
+            "name": "debug",
+            "displayName": "Debug (plugins)",
+            "description": "Modules built as runtime-loaded plugins, validation layer on by default",
+            "inherits": "base",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+        },
+        {
+            "name": "release",
+            "displayName": "Release (plugins)",
+            "inherits": "base",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+        },
+        {
+            "name": "static",
+            "displayName": "Release (static modules)",
+            "description": "Everything linked into the executable, no plugin loading",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "BDEX_SHARED_MODULES": "OFF"
+            }
+        },
+        {
+            "name": "asan",
+            "displayName": "Debug + ASan/UBSan",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer"
+            }
+        }
+    ],
+    "buildPresets": [
+        { "name": "debug", "configurePreset": "debug" },
+        { "name": "release", "configurePreset": "release" },
+        { "name": "static", "configurePreset": "static" },
+        { "name": "asan", "configurePreset": "asan" }
+    ],
+    "testPresets": [
+        {
+            "name": "debug",
+            "configurePreset": "debug",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "release",
+            "configurePreset": "release",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "static",
+            "configurePreset": "static",
+            "output": { "outputOnFailure": true }
+        },
+        {
+            "name": "asan",
+            "configurePreset": "asan",
+            "output": { "outputOnFailure": true },
+            "filter": { "exclude": { "name": "VulkanHeadless" } }
+        }
+    ]
+}
