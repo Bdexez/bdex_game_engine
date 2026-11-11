@@ -196,6 +196,11 @@ private:
 
     void setDebugName(VkObjectType type, u64 handle, const std::string& name);
 
+    /// Fills mip levels 1..n by successive downscaling blits. Expects every
+    /// level in TRANSFER_DST_OPTIMAL; leaves the texture in TRANSFER_SRC_OPTIMAL.
+    void generateMipmaps(VkCommandBuffer commandBuffer, Texture& texture);
+    [[nodiscard]] bool supportsMipGeneration(VkFormat format) const;
+
     // Swapchain internals (VulkanSwapchain.cpp).
     Result<> buildSwapchain(Swapchain& swapchain);
     void releaseSwapchainImages(Swapchain& swapchain);
@@ -220,6 +225,7 @@ private:
     bool validationEnabled_ = false;
     bool debugUtilsEnabled_ = false;
     bool presentationEnabled_ = false;
+    f32 maxSamplerAnisotropy_ = 1.0f;  ///< 1 when the feature is unavailable.
     std::atomic<u32> validationErrors_{0};
 
     // VK_EXT_debug_utils entry points (not exported by the loader).

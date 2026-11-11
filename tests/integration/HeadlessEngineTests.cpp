@@ -393,12 +393,14 @@ TEST(VulkanHeadless, RhiRoundTripsTextureData) {
     desc.height = image.height;
     desc.format = rhi::Format::RGBA8Unorm;
     desc.usage = rhi::TextureUsage::Sampled | rhi::TextureUsage::TransferSrc;
+    desc.mipLevels = 0;  // full chain: exercises mip generation as well
     desc.debugName = "round trip";
     const rhi::TextureHandle texture = device.createTexture(desc);
     device.writeTexture(texture, rhi::asBytes(image.pixels));
 
-    EXPECT_EQ(device.readTexture(texture), image.pixels);
+    EXPECT_EQ(device.readTexture(texture), image.pixels);  // level 0 is untouched
     EXPECT_EQ(device.textureDesc(texture).width, 64u);
+    EXPECT_EQ(device.textureDesc(texture).mipLevels, 7u);  // 64, 32, 16, 8, 4, 2, 1
 
     device.destroyTexture(texture);
     EXPECT_EQ(device.textureDesc(texture).width, 0u);  // stale handle

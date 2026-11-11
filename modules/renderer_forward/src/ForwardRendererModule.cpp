@@ -5,6 +5,7 @@
 //
 // Configuration:
 //   renderer.vsync                    (default true)
+//   renderer.anisotropy               anisotropic filtering, 1-16 (default 8)
 //   renderer.width, renderer.height   offscreen size when there is no window
 //                                     system at all (default 1280x720)
 

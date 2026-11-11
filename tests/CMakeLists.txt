@@ -24,6 +24,7 @@ add_executable(bdex_tests
     core/TypeIdTests.cpp
     ecs/WorldTests.cpp
     assets/AssetTests.cpp
+    rhi/RhiTests.cpp
     scene/SceneTests.cpp
     integration/HeadlessEngineTests.cpp)
 target_include_directories(bdex_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

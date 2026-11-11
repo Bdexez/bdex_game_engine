@@ -13,6 +13,7 @@
 #include <bdex/platform/Window.hpp>
 #include <bdex/rhi/Device.hpp>
 
+#include <algorithm>
 #include <memory>
 
 namespace bdex {
@@ -79,7 +80,12 @@ public:
     }
 
     [[nodiscard]] TextureHandle createTexture(const TextureDesc& desc) override {
-        return textures_.insert(desc);
+        // Same contract as a real backend: the stored description carries
+        // the resolved mip count.
+        TextureDesc resolved = desc;
+        const u32 fullChain = fullMipChainLength(desc.width, desc.height);
+        resolved.mipLevels = desc.mipLevels == 0 ? fullChain : std::min(desc.mipLevels, fullChain);
+        return textures_.insert(resolved);
     }
     void destroyTexture(TextureHandle texture) override { textures_.remove(texture); }
     void writeTexture(TextureHandle texture, std::span<const std::byte> pixels) override {

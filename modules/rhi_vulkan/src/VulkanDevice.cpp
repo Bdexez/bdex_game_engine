@@ -31,9 +31,9 @@ LayoutSync layoutSync(VkImageLayout layout) {
         case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
             return {VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT};
         case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-            return {VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT};
+            return {VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT};
         case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-            return {VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT};
+            return {VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT};
         default:
             BDEX_ASSERT(false, "unsupported image layout");
             return {VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_NONE};
@@ -320,6 +320,16 @@ Result<> Device::createLogicalDevice(const DeviceConfig& config) {
     features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features.pNext = &features13;
 
+    // Optional features: enabled when the hardware has them.
+    VkPhysicalDeviceFeatures supported{};
+    vkGetPhysicalDeviceFeatures(physicalDevice_, &supported);
+    if (supported.samplerAnisotropy == VK_TRUE) {
+        features.features.samplerAnisotropy = VK_TRUE;
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(physicalDevice_, &properties);
+        maxSamplerAnisotropy_ = properties.limits.maxSamplerAnisotropy;
+    }
+
     std::vector<const char*> extensions;
     if (config.presentation) {
         extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
@@ -547,7 +557,7 @@ void Device::transition(VkCommandBuffer commandBuffer, Texture& texture, VkImage
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = texture.image;
-    barrier.subresourceRange = {aspectMask(texture.desc.format), 0, 1, 0, 1};
+    barrier.subresourceRange = {aspectMask(texture.desc.format), 0, VK_REMAINING_MIP_LEVELS, 0, 1};
 
     VkDependencyInfo dependency{};
     dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
@@ -556,6 +566,66 @@ void Device::transition(VkCommandBuffer commandBuffer, Texture& texture, VkImage
     vkCmdPipelineBarrier2(commandBuffer, &dependency);
 
     texture.layout = layout;
+}
+
+bool Device::supportsMipGeneration(VkFormat format) const {
+    VkFormatProperties properties{};
+    vkGetPhysicalDeviceFormatProperties(physicalDevice_, format, &properties);
+    constexpr VkFormatFeatureFlags required = VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+                                              VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                              VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    return (properties.optimalTilingFeatures & required) == required;
+}
+
+void Device::generateMipmaps(VkCommandBuffer commandBuffer, Texture& texture) {
+    // The tracked layout describes the whole image, so individual levels are
+    // moved with local barriers and brought back to a single common layout
+    // (TRANSFER_SRC) before returning.
+    const auto moveLevel = [&](u32 level, VkImageLayout from, VkImageLayout to) {
+        const LayoutSync source = layoutSync(from);
+        const LayoutSync destination = layoutSync(to);
+        VkImageMemoryBarrier2 barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        barrier.srcStageMask = source.stage;
+        barrier.srcAccessMask = source.access;
+        barrier.dstStageMask = destination.stage;
+        barrier.dstAccessMask = destination.access;
+        barrier.oldLayout = from;
+        barrier.newLayout = to;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = texture.image;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1, 0, 1};
+
+        VkDependencyInfo dependency{};
+        dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dependency.imageMemoryBarrierCount = 1;
+        dependency.pImageMemoryBarriers = &barrier;
+        vkCmdPipelineBarrier2(commandBuffer, &dependency);
+    };
+
+    i32 width = static_cast<i32>(texture.desc.width);
+    i32 height = static_cast<i32>(texture.desc.height);
+    for (u32 level = 1; level < texture.desc.mipLevels; ++level) {
+        moveLevel(level - 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+        const i32 nextWidth = std::max(width / 2, 1);
+        const i32 nextHeight = std::max(height / 2, 1);
+        VkImageBlit blit{};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1, 0, 1};
+        blit.srcOffsets[1] = {width, height, 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+        blit.dstOffsets[1] = {nextWidth, nextHeight, 1};
+        vkCmdBlitImage(commandBuffer, texture.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       texture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                       VK_FILTER_LINEAR);
+        width = nextWidth;
+        height = nextHeight;
+    }
+    moveLevel(texture.desc.mipLevels - 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    texture.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 }
 
 // =============================================================================
@@ -652,12 +722,25 @@ rhi::TextureHandle Device::createTexture(const rhi::TextureDesc& desc) {
     texture.desc = desc;
     texture.format = toVkFormat(desc.format);
 
+    // Resolve the mip count: 0 means "full chain", and anything above one
+    // level needs blit support for the format.
+    const bool renderTarget = hasFlag(desc.usage, rhi::TextureUsage::ColorAttachment) ||
+                              hasFlag(desc.usage, rhi::TextureUsage::DepthStencilAttachment);
+    const u32 fullChain = rhi::fullMipChainLength(desc.width, desc.height);
+    u32 mipLevels = desc.mipLevels == 0 ? fullChain : std::min(desc.mipLevels, fullChain);
+    BDEX_ASSERT(!renderTarget || mipLevels == 1, "render targets must have a single mip level");
+    if (mipLevels > 1 && !supportsMipGeneration(texture.format)) {
+        log::warn("vulkan", "{} cannot be mipmapped on this device", rhi::formatName(desc.format));
+        mipLevels = 1;
+    }
+    texture.desc.mipLevels = mipLevels;
+
     VkImageCreateInfo imageInfo{};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
     imageInfo.format = texture.format;
     imageInfo.extent = {desc.width, desc.height, 1};
-    imageInfo.mipLevels = 1;
+    imageInfo.mipLevels = mipLevels;
     imageInfo.arrayLayers = 1;
     imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
     imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -666,6 +749,10 @@ rhi::TextureHandle Device::createTexture(const rhi::TextureDesc& desc) {
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (hasFlag(desc.usage, rhi::TextureUsage::Sampled)) {
         imageInfo.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;  // writeTexture
+    }
+    if (mipLevels > 1) {
+        // Each level is blitted from the previous one.
+        imageInfo.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     }
 
     VmaAllocationCreateInfo allocationInfo{};
@@ -678,7 +765,7 @@ rhi::TextureHandle Device::createTexture(const rhi::TextureDesc& desc) {
     viewInfo.image = texture.image;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format = texture.format;
-    viewInfo.subresourceRange = {aspectMask(desc.format), 0, 1, 0, 1};
+    viewInfo.subresourceRange = {aspectMask(desc.format), 0, mipLevels, 0, 1};
     BDEX_VK_CHECK(vkCreateImageView(device_, &viewInfo, nullptr, &texture.view));
 
     setDebugName(VK_OBJECT_TYPE_IMAGE, handleToU64(texture.image), desc.debugName);
@@ -728,6 +815,9 @@ void Device::writeTexture(rhi::TextureHandle handle, std::span<const std::byte> 
         vkCmdCopyBufferToImage(commandBuffer, staging->handle, texture->image,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
+        if (texture->desc.mipLevels > 1) {
+            generateMipmaps(commandBuffer, *texture);
+        }
         if (hasFlag(texture->desc.usage, rhi::TextureUsage::Sampled)) {
             transition(commandBuffer, *texture, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         }
@@ -812,6 +902,10 @@ rhi::SamplerHandle Device::createSampler(const rhi::SamplerDesc& desc) {
     samplerInfo.addressModeV = toVkAddressMode(desc.addressMode);
     samplerInfo.addressModeW = toVkAddressMode(desc.addressMode);
     samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
+    if (desc.maxAnisotropy > 1.0f && maxSamplerAnisotropy_ > 1.0f) {
+        samplerInfo.anisotropyEnable = VK_TRUE;
+        samplerInfo.maxAnisotropy = std::min(desc.maxAnisotropy, maxSamplerAnisotropy_);
+    }
 
     Sampler sampler;
     BDEX_VK_CHECK(vkCreateSampler(device_, &samplerInfo, nullptr, &sampler.handle));

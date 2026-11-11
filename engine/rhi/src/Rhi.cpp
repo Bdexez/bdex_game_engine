@@ -24,6 +24,14 @@ u32 bytesPerPixel(Format format) {
     return 0;
 }
 
+u32 fullMipChainLength(u32 width, u32 height) {
+    u32 levels = 1;
+    for (u32 size = width > height ? width : height; size > 1; size /= 2) {
+        ++levels;
+    }
+    return levels;
+}
+
 std::string_view formatName(Format format) {
     switch (format) {
         case Format::Undefined: return "Undefined";

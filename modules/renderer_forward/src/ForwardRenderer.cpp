@@ -75,6 +75,8 @@ Result<> ForwardRenderer::initialize() {
         "material layout",
     });
     rhi::SamplerDesc samplerDesc;
+    samplerDesc.maxAnisotropy =
+        static_cast<f32>(std::clamp(config.getFloat("renderer.anisotropy", 8.0), 1.0, 16.0));
     samplerDesc.debugName = "default sampler";
     defaultSampler_ = device_.createSampler(samplerDesc);
     whiteTexture_ = createTexture(assets::makeSolidImage(1, 1, {255, 255, 255, 255}));
@@ -180,6 +182,7 @@ render::TextureHandle ForwardRenderer::createTexture(const assets::ImageData& im
     desc.height = image.height;
     desc.format = rhi::Format::RGBA8Srgb;  // color data, authored in sRGB
     desc.usage = rhi::TextureUsage::Sampled;
+    desc.mipLevels = 0;  // full chain, generated on upload
     desc.debugName = "texture";
     const rhi::TextureHandle texture = device_.createTexture(desc);
     device_.writeTexture(texture, rhi::asBytes(image.pixels));
