@@ -61,7 +61,10 @@ Result<> ForwardRenderer::initialize() {
 
         rhi::BindGroupDesc groupDesc;
         groupDesc.layout = frameLayout_;
-        groupDesc.entries.push_back({.binding = 0, .buffer = frameBuffers_.back()});
+        rhi::BindGroupEntry uniforms;
+        uniforms.binding = 0;
+        uniforms.buffer = frameBuffers_.back();
+        groupDesc.entries.push_back(uniforms);
         groupDesc.debugName = "frame bind group";
         frameBindGroups_.push_back(device_.createBindGroup(groupDesc));
     }
@@ -197,7 +200,11 @@ render::MaterialHandle ForwardRenderer::createMaterial(const render::MaterialDes
 
     rhi::BindGroupDesc groupDesc;
     groupDesc.layout = materialLayout_;
-    groupDesc.entries.push_back({.binding = 0, .texture = *albedo, .sampler = defaultSampler_});
+    rhi::BindGroupEntry albedoEntry;
+    albedoEntry.binding = 0;
+    albedoEntry.texture = *albedo;
+    albedoEntry.sampler = defaultSampler_;
+    groupDesc.entries.push_back(albedoEntry);
     groupDesc.debugName = "material";
 
     GpuMaterial material;

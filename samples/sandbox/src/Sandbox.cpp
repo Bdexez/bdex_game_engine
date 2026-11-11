@@ -105,15 +105,24 @@ private:
         const render::TextureHandle crate = gfx.createTexture(
             assets::makeCheckerboard(64, 4, {255, 255, 255, 255}, {200, 200, 200, 255}));
 
-        groundMaterial_ = gfx.createMaterial(
-            {.baseColor = Vec4(0.55f, 0.6f, 0.55f, 1.0f), .albedo = checker, .specular = 0.05f});
-        sphereMaterial_ = gfx.createMaterial({.baseColor = Vec4(0.95f, 0.95f, 1.0f, 1.0f),
-                                              .specular = 0.9f,
-                                              .shininess = 96.0f});
+        render::MaterialDesc ground;
+        ground.baseColor = Vec4(0.55f, 0.6f, 0.55f, 1.0f);
+        ground.albedo = checker;
+        ground.specular = 0.05f;
+        groundMaterial_ = gfx.createMaterial(ground);
+
+        render::MaterialDesc polished;  // no texture: plain base color
+        polished.baseColor = Vec4(0.95f, 0.95f, 1.0f, 1.0f);
+        polished.specular = 0.9f;
+        polished.shininess = 96.0f;
+        sphereMaterial_ = gfx.createMaterial(polished);
+
         for (u32 i = 0; i < kCubeCount; ++i) {
-            const Vec3 color = hsvToRgb(static_cast<f32>(i) / kCubeCount, 0.65f, 0.95f);
-            cubeMaterials_[i] = gfx.createMaterial(
-                {.baseColor = Vec4(color, 1.0f), .albedo = crate, .specular = 0.4f});
+            render::MaterialDesc painted;
+            painted.baseColor = Vec4(hsvToRgb(static_cast<f32>(i) / kCubeCount, 0.65f, 0.95f), 1.0f);
+            painted.albedo = crate;
+            painted.specular = 0.4f;
+            cubeMaterials_[i] = gfx.createMaterial(painted);
         }
         return {};
     }

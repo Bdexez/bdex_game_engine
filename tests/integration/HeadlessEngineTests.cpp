@@ -73,8 +73,9 @@ struct TestEngine {
         world().get<scene::Transform>(camera).position = Vec3(0.0f, 0.0f, 6.0f);
 
         const render::MeshHandle cube = renderer().createMesh(assets::makeCube());
-        const render::MaterialHandle material =
-            renderer().createMaterial({.baseColor = Vec4(1.0f, 0.2f, 0.1f, 1.0f)});
+        render::MaterialDesc red;
+        red.baseColor = Vec4(1.0f, 0.2f, 0.1f, 1.0f);
+        const render::MaterialHandle material = renderer().createMaterial(red);
         std::vector<ecs::Entity> entities;
         for (u32 i = 0; i < count; ++i) {
             const ecs::Entity entity = scene().createEntity("cube");
