@@ -12,7 +12,7 @@ The project separates engine interfaces from their implementations: windowing, g
 - **Simulation loop:** ordered execution phases, fixed timestep updates, and a multithreaded job system.
 - **ECS and scenes:** entities with generational handles, application-defined components, typed views, and hierarchical transforms.
 - **3D rendering:** perspective cameras, meshes, textures, materials, and Blinn-Phong directional lighting through an extensible forward renderer.
-- **Vulkan backend:** dynamic rendering, synchronization2, memory management with Vulkan Memory Allocator, and PNG screenshots.
+- **Vulkan backend:** dynamic rendering, synchronization2, memory management with Vulkan Memory Allocator, mipmap generation, anisotropic filtering, and PNG screenshots.
 - **Assets:** a virtual file system, asset caching, OBJ, TGA, and SPIR-V loaders, plus procedural cubes, planes, spheres, and textures.
 - **Headless execution:** offscreen Vulkan rendering or a `null` graphics backend for tests without a GPU.
 
@@ -46,6 +46,8 @@ cmake/          Helpers for building libraries, modules, and shaders
 
 By default, modules are shared libraries loaded at runtime. Set the CMake option `BDEX_SHARED_MODULES=OFF` to link them statically and register their factories in the executable.
 
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) describes the kernel, the frame phases, the RHI frame protocol, and how to write a new module.
+
 ## Requirements
 
 To build the default configuration:
@@ -73,6 +75,14 @@ From the repository root:
 cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build --parallel
 ./build/bin/sandbox
+```
+
+The same steps are available as CMake presets (`debug`, `release`, `static`, `asan`), each building into its own `build-<preset>/` directory:
+
+```sh
+cmake --preset debug
+cmake --build --preset debug --parallel
+ctest --preset debug
 ```
 
 Executables, shared libraries, and modules are placed in `build/bin/`. Shaders are compiled automatically into `build/bin/assets/`, and the sandbox configuration is copied to `build/bin/sandbox.ini`.
@@ -131,6 +141,7 @@ height = 720
 
 [renderer]
 vsync = true
+anisotropy = 8
 ```
 
 Override any key at startup with `--set`:
@@ -158,6 +169,12 @@ Request Vulkan diagnostics during a headless run:
 ```
 
 The validation layer must be installed for these diagnostics to be active.
+
+If validation reports errors about extensions the engine never enables, an implicit Vulkan layer installed on the machine (overlay, frame generation, capture tool) is most likely modifying the engine's requests. Rule it out by running once without implicit layers:
+
+```sh
+VK_LOADER_LAYERS_DISABLE='~implicit~' ./build/bin/sandbox --set rhi.validation=true --strict
+```
 
 ## Build options
 
@@ -190,5 +207,6 @@ If GoogleTest is missing, CMake prints a warning and continues configuration wit
 - **Add gameplay:** define components and iterate over [`ecs::World`](engine/ecs/include/bdex/ecs/World.hpp) views, then register your systems with the scheduler.
 - **Add a render feature:** implement `IRenderFeature` and register it with the renderer. The [sandbox sky](samples/sandbox/src/SkyFeature.cpp) provides a complete example.
 - **Add an asset format:** register a loader with [`AssetManager`](engine/assets/include/bdex/assets/AssetManager.hpp).
+- **Add a module:** implement `IModule`, declare it with `bdex_add_module()`, and list it in `engine.modules`. See [Writing a module](docs/ARCHITECTURE.md#writing-a-module).
 
 The [sandbox application](samples/sandbox/src/Sandbox.cpp) brings these mechanisms together in a working example.
