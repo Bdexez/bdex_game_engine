@@ -115,29 +115,41 @@ Result<> Device::createInstance(const DeviceConfig& config) {
                     versionString(instanceVersion));
     }
 
+    u32 availableCount = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &availableCount, nullptr);
+    std::vector<VkExtensionProperties> availableExtensions(availableCount);
+    vkEnumerateInstanceExtensionProperties(nullptr, &availableCount, availableExtensions.data());
+    const auto isAvailable = [&availableExtensions](const char* name) {
+        return std::any_of(availableExtensions.begin(), availableExtensions.end(),
+                           [name](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });
+    };
+
     std::vector<const char*> extensions;
     for (const std::string& extension : config.instanceExtensions) {
         extensions.push_back(extension.c_str());
     }
-    std::vector<const char*> layers;
+    // Prerequisite of the modern presentation extensions (present id/timing,
+    // surface maintenance...). The engine does not use them yet, but
+    // presentation layers stacked on top of the application (frame
+    // generation, latency tools) enable them on its behalf and expect the
+    // instance to be ready for it.
+    if (config.presentation &&
+        isAvailable(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) &&
+        std::none_of(extensions.begin(), extensions.end(), [](const char* name) {
+            return std::strcmp(name, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) == 0;
+        })) {
+        extensions.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+    }
 
+    std::vector<const char*> layers;
     if (config.validation) {
         u32 layerCount = 0;
         vkEnumerateInstanceLayerProperties(&layerCount, nullptr);
-        std::vector<VkLayerProperties> available(layerCount);
-        vkEnumerateInstanceLayerProperties(&layerCount, available.data());
-        const bool hasLayer = std::any_of(available.begin(), available.end(), [](const auto& l) {
-            return std::strcmp(l.layerName, kValidationLayer) == 0;
-        });
-
-        u32 extensionCount = 0;
-        vkEnumerateInstanceExtensionProperties(nullptr, &extensionCount, nullptr);
-        std::vector<VkExtensionProperties> availableExtensions(extensionCount);
-        vkEnumerateInstanceExtensionProperties(nullptr, &extensionCount,
-                                               availableExtensions.data());
-        const bool hasDebugUtils =
-            std::any_of(availableExtensions.begin(), availableExtensions.end(), [](const auto& e) {
-                return std::strcmp(e.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0;
+        std::vector<VkLayerProperties> availableLayers(layerCount);
+        vkEnumerateInstanceLayerProperties(&layerCount, availableLayers.data());
+        const bool hasLayer =
+            std::any_of(availableLayers.begin(), availableLayers.end(), [](const auto& l) {
+                return std::strcmp(l.layerName, kValidationLayer) == 0;
             });
 
         if (hasLayer) {
@@ -146,7 +158,7 @@ Result<> Device::createInstance(const DeviceConfig& config) {
         } else {
             log::warn("vulkan", "validation requested but {} is not installed", kValidationLayer);
         }
-        if (hasDebugUtils) {
+        if (isAvailable(VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
             extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
             debugUtilsEnabled_ = true;
         }
